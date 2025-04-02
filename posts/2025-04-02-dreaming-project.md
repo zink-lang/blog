@@ -13,7 +13,7 @@ It's always been a dream building a programming langauge as a system engineer, s
 langauge is part of the mediums for us communicating with machines and others, also, a baseline
 tool for expressing our thoughts, creating our artworks, and so on.
 
-Things could be done better with the current tech, at least, people can write their programs in a
-**single langauge** with **well-arched package manager** and **debugging system**.
+Things could be done better with the current tech, at least, people can write their smart contracts
+in a **single langauge** with **well-arched package manager** and **debugging system**.
 
 It's possible and we are working on it.
