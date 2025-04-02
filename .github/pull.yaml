@@ -1,0 +1,5 @@
+version: "1"
+rules:
+  - base: gh-pages
+    upstream: zink-lang:gh-pages
+    mergeMethod: hardreset

@@ -12,13 +12,19 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: clearloop/sonata@0.1.5
+      - uses: clearloop/sonata@0.1.7
 
       - name: Build the site
         run: sonata build
+
+      - name: Copy pull action
+        run: |
+          mkdir -p ./out/.github/
+          cp .github/pull.yaml ./out/.github/
 
       - name: Deploy
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./out
+          exclude_assets: ""
