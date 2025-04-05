@@ -1,0 +1,150 @@
+
+<html lang="en" class="dark dark:bg-black">
+  <head>
+    <title>Debugging the Depths</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <meta name="description" content="Empowering everyone to build reliable and efficient static site.">
+    <link rel="icon" type="image/x-icon" href="/favicon.ico">
+
+    <!-- twitter -->
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:site" content="@zinkonx">
+    <meta name="twitter:creator" content="@g4titanx">
+
+    <!-- og -->
+    <meta property="og:title" content="Debugging the Depths">    
+    <meta property="og:description" content="Solving Stack Mismatches in Zink&#x27;s ERC20 Implementation">
+    <meta property="og:image" content="https://avatars.githubusercontent.com/u/138247979?s&#x3D;400&amp;u&#x3D;f5c906945b7378f8063d845c7181e7a3f0e25070&amp;v&#x3D;4">
+    
+    <!-- theme  -->
+    <link rel="stylesheet" href="/theme.css">
+
+    <!-- favicon -->
+        <link rel="shortcut icon" href="//favicon.ico">
+
+    <!-- styles for post -->
+        <link rel="stylesheet" href="/highlight.css">
+        <script src="/highlight.js" defer></script>
+
+    <!-- livereload -->
+</head>
+  <body class="dark:text-white p-8">
+     <nav class="mb-10">
+    <a href="/"><span class="text-3xl bold"> Zink Blog </span></a>
+</nav>
+     <article class="prose dark:prose-invert pt-6 max-w-5xl mx-auto">
+    <h1 class="underline">Debugging the Depths</h1>
+    <div class="text text-zinc-500 font-bold">
+      Apr. 04, 2025 · <a href="https://x.com/g4titanx" target="_blank">@g4titan</a>
+    </div>
+    <div class="mt-6">  
+      <p>I’ve been tangled up in a bug in Zink lately that’s been equal parts maddening and fascinating. It’s <a href="https://github.com/zink-lang/zink/issues/306">Issue #306</a>: the ERC20 transfer test in <code>zink/examples/erc20.rs</code> fails with an “Insufficient balance” error, even though the storage shows the right balance. What started as a contract-level puzzle quickly spiraled into a compiler-level labyrinth, which led to <a href="https://github.com/zink-lang/zink/issues/324">Issue #324</a> about stabilizing stack checks. This post is my raw dump—everything I’ve pieced together so far, technical and messy, a map I can always retrace.</p>
+<p>Tianyi encouraged me to write this, pointing out that it’s not just about solving the bug, it’s about building a mental framework for tackling hairy problems like this. He’s right, this might be one of the toughest nuts I’ve cracked in my career, and even if I stumble into a fix with a few lucky lines, the process matters. So here’s the story: the problem, the suspects, the debugging steps, the fixes I’ve tried, and where I’m stuck.</p>
+<h2>The Obvious Problem: ERC20 Transfer Goes Haywire</h2>
+<p>As stated in issue #306, <code>erc20</code> transfer test fails with <code>&quot;Insufficient balance&quot;</code> despite storage showing correct balance value. Yet, during the transfer execution, it behaved as if the sender didn’t have enough tokens (broke, but that wasn’t the case)</p>
+<pre><code class="language-rust">evm = evm.commit(false);
+let info = evm
+    .calldata(&amp;contract.encode(&amp;[
+        b&quot;transfer(address,uint256)&quot;.to_vec(),
+        spender.to_bytes32().to_vec(),
+        half_value.to_bytes32().to_vec(),
+    ])?)
+    .call(address)?;
+println!(&quot;{info:?}&quot;);
+assert_eq!(info.ret, true.to_bytes32(), &quot;{info:?}&quot;);
+</code></pre>
+<h2>Debugging: Chasing the Stack Ghost</h2>
+<p>In an attempt to trace this issue, I added debug prints at some points in the test and the process of doing this I noticed a bug in <code>_update</code>’s logic:</p>
+<pre><code class="language-rust">if to.eq(Address::empty()) {
+    TotalSupply::set(TotalSupply::get().sub(value));
+} else {
+    TotalSupply::set(TotalSupply::get().add(value));
+}
+</code></pre>
+<p>Now, this incorrectly updates TotalSupply instead of the recipient’s balance. It’s not the cause of the current revert (since that happens on the sender’s check), but it’ll break the transfer’s correctness. so I updated it:</p>
+<pre><code class="language-rust">let to_balance = Balances::get(to);
+Balances::set(to, to_balance.add(value));
+</code></pre>
+<p>Back to debugging, after adding custom logs at several points in the test, I was able to track the source of the issue. The issue orginates from<code> _update</code>’s else branch:</p>
+<pre><code class="language-rust">if from.eq(Address::empty()) {
+    TotalSupply::set(TotalSupply::get().add(value));
+} else {
+    DebugEvent::Balance(U256::from(42)).emit();
+}
+DebugEvent::TestLog(U256::from(99)).emit();
+</code></pre>
+<p>The bug wasn’t “insufficient balance” (that was a misread)—it was a stack underflow when <code>_update</code> returned to <code>_transfer</code>. <code>_transfer</code> expects a bool (<code>SP = 1</code>), but <code>_update</code> was leaving <code>SP = 0</code>, tanking at <code>call_retur</code>n’s <code>_jump()</code>. So I traced it to the else branch not setting up a return value, unlike linear flows that implicitly worked (straight up logic without if-else, just if branch worked too).</p>
+<p>I fixed it by updating <code>call_return</code> to push 1 for <code>empty-result</code> internal calls:</p>
+<pre><code class="language-rust">pub fn call_return(&amp;mut self, results: &amp;[ValType]) -&gt; Result&lt;()&gt; {
+    let len = results.len() as u16;
+    if results.is_empty() {
+        if self.sp() == 0 {
+            self._push1()?; // Push 1 for _transfer
+        }
+        self._jump()?;
+    } else {
+        while self.sp() &gt; len + 1 {
+            self._drop()?;
+        }
+        self.shift_stack(len, false)?;
+        self._jump()?;
+    }
+    Ok(())
+}
+</code></pre>
+<p>This fixed the stack issue—<code>_update</code> now returns true to <code>_transfer</code>, and the underflow error is gone. But then that triggered public functions like <code>name()</code> started failing with <code>InvalidJump</code>. Turns out, <code>handle_frame_popping</code>’s new version I added was the cause:</p>
+<pre><code class="language-rust">_ =&gt; {
+    self.table.label(frame.original_pc_offset, self.masm.pc());
+    self.masm._jumpdest()?;
+    if !self.is_main &amp;&amp; self.abi.is_none() &amp;&amp; self.ty.results().is_empty() &amp;&amp; self.masm.sp() == 0 {
+        self.masm._push1()?;
+        self.masm._jump()?;
+    }
+    Ok(())
+}
+</code></pre>
+<p>the <code>_push1(1)</code> and <code>_jump()</code> worked for <code>_update</code>, but for <code>name()</code> (a public call with <code>abi.is_some()</code>), it added an extra jump that broke the <code>main_return</code> flow (<code>RETURN</code> for string data). Reverting to the old version fixed <code>name()</code>:</p>
+<pre><code class="language-rust">_ =&gt; {
+    self.table.label(frame.original_pc_offset, self.masm.pc());
+    self.masm._jumpdest()?;
+    Ok(())
+}
+</code></pre>
+<p>now <code>name()</code> returns <code>&quot;The Zink Language&quot;</code> again, but <code>_transfer</code>’s hitting <code>InvalidJump (ret: [] instead of [..., 1] at erc20.rs:295:9)</code>. the stack’s fine <code>(SP = 1 from call_return)</code>, but the jump target’s off <code>call_return</code>’s <code>_jump()</code> isn’t landing at <code>_transfer</code>’s return point. the jump table’s <code>original_pc_offset</code> isn’t syncing right I suppose</p>
+<p>I asked Tianyi about this and he said “…it could be caused by our mock of stack usage in compilation”. so he opened <a href="https://github.com/zink-lang/zink/issues/324">Issue #324</a> and decided that we tackle that first. He also pointed to Huff’s dispatching docs—stack outputs like takes (1) returns (1)—and suggested tests. In response to this, I wrote <code>tests/stack.rs</code> for <code>if-else</code>, <code>loops</code>, and <code>calls</code>.</p>
+<h2>Fixes So Far</h2>
+<p>Here’s what I’ve tried to stabilize the stack:</p>
+<p>Fix 1: Tweak Internal Calls
+In visitor/call.rs, I cut the initial increment_sp(1) in call_internal and adjusted SP post-call:</p>
+<pre><code class="language-rust">let current_sp = self.masm.sp();
+while current_sp &gt; *results as u16 {
+    self.masm._drop()?;
+}
+if current_sp &lt; *results as u16 {
+    self.masm.increment_sp(*results as u16 - current_sp)?;
+}
+</code></pre>
+<p>Fix 2: Enforce Stack at _end
+In visitor/control.rs, I made _end check SP against returns:</p>
+<pre><code class="language-rust">if self.masm.sp() != self.returns {
+    return Err(Error::StackMismatch { expected: self.returns, found: self.masm.sp() });
+}
+</code></pre>
+<p>This caught mismatches but didn’t fix the root cause—SP was still off.</p>
+<p>Right now, the tests fail with:</p>
+<ul>
+<li><code>dispatcher_stack: SP = 2, expected 1</code> errprs . Internal calls leave a ghost item.</li>
+<li><code>if_else_stack: Extra function with SP = 1, expected 0</code>. Compiler artifact?</li>
+<li><code>loop_stack: Returns 8, not 7.</code> Test runs the wrong WAT.</li>
+</ul>
+<p>Apparently, the stack’s still haunted 😂. I suspect <code>call_internal</code>’s jump handling or <code>function::new</code>’s setup is the culprit. 
+Anyways, I’m glad I took the advice to write this, it’s clearing my head, but I’m not out of tricks yet.</p>
+<h2>My View: Stack Management is a Puzzle</h2>
+<p>The EVM’s stack is unforgiving, and Zink’s job is to map Rust’s abstractions onto it perfectly. Every push and pop has to align, or you’re toast. I’m starting to see stack management as a puzzle, to be honest, each function’s a piece. It’s brutal, but I’m hooked, solving this is an important breakthrough for Zink.</p>
+
+    </div>    
+</article>
+     <footer></footer>
+  </body>
+</html>
