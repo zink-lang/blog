@@ -30,9 +30,7 @@ assert_eq!(info.ret, true.to_bytes32(), "{info:?}");
 
 ## Debugging: Chasing the Stack Ghost
 
-Debugging a compiler bug is like stalking a ghost—you need tools to make it visible. The `RUST_LOG=trace` logs were my lantern, lighting up the stack’s dance.
-
-In an attempt to trace this issue, i added debug prints at some points in the test and the process of doing this i noticed a bug in `_update`'s logic:
+In an attempt to trace this issue, I added debug prints at some points in the test and the process of doing this I noticed a bug in `_update`'s logic:
 ```rust
 if to.eq(Address::empty()) {
     TotalSupply::set(TotalSupply::get().sub(value));
@@ -40,13 +38,13 @@ if to.eq(Address::empty()) {
     TotalSupply::set(TotalSupply::get().add(value));
 }
 ```
-Now, this incorrectly updates TotalSupply instead of the recipient’s balance. It’s not the cause of the current revert (since that happens on the sender’s check), but it’ll break the transfer’s correctness. so i updated it to this
+Now, this incorrectly updates TotalSupply instead of the recipient’s balance. It’s not the cause of the current revert (since that happens on the sender’s check), but it’ll break the transfer’s correctness. so I updated it:
 ```rust
 let to_balance = Balances::get(to);
 Balances::set(to, to_balance.add(value));
 ```
 
-Back to debugging, after adding custom logs at several points in the test, i was able to track the source of the issue. The issue orginates from` _update`’s else branch:
+Back to debugging, after adding custom logs at several points in the test, I was able to track the source of the issue. The issue orginates from` _update`’s else branch:
 ```rust
 if from.eq(Address::empty()) {
     TotalSupply::set(TotalSupply::get().add(value));
@@ -56,7 +54,7 @@ if from.eq(Address::empty()) {
 DebugEvent::TestLog(U256::from(99)).emit();
 ```
 
-The bug wasn’t “insufficient balance” (that was a misread)—it was a stack underflow when `_update` returned to `_transfer`. `_transfer` expects a bool (`SP = 1`), but `_update` was leaving `SP = 0`, tanking at `call_retur`n’s `_jump()`. So i traced it to the else branch not setting up a return value, unlike linear flows that implicitly worked (straight up logic without if-else, just if branch worked too).
+The bug wasn’t “insufficient balance” (that was a misread)—it was a stack underflow when `_update` returned to `_transfer`. `_transfer` expects a bool (`SP = 1`), but `_update` was leaving `SP = 0`, tanking at `call_retur`n’s `_jump()`. So I traced it to the else branch not setting up a return value, unlike linear flows that implicitly worked (straight up logic without if-else, just if branch worked too).
 
 I fixed it by updating `call_return` to push 1 for `empty-result` internal calls:
 ```rust
@@ -78,7 +76,7 @@ pub fn call_return(&mut self, results: &[ValType]) -> Result<()> {
 }
 ```
 
-This fixed the stack issue—`_update` now returns true to `_transfer`, and the underflow error is gone. But then that triggered public functions like `name()` started failing with `InvalidJump`. Turns out, `handle_frame_popping`’s new version i added was the cause:
+This fixed the stack issue—`_update` now returns true to `_transfer`, and the underflow error is gone. But then that triggered public functions like `name()` started failing with `InvalidJump`. Turns out, `handle_frame_popping`’s new version I added was the cause:
 ```rust
 _ => {
     self.table.label(frame.original_pc_offset, self.masm.pc());
@@ -99,9 +97,9 @@ _ => {
     Ok(())
 }
 ```
-now `name()` returns `"The Zink Language"` again, but `_transfer`’s hitting `InvalidJump (ret: [] instead of [..., 1] at erc20.rs:295:9)`. the stack’s fine `(SP = 1 from call_return)`, but the jump target’s off `call_return`’s `_jump()` isn’t landing at `_transfer`’s return point. the jump table’s `original_pc_offset` isn’t syncing right i suppose
+now `name()` returns `"The Zink Language"` again, but `_transfer`’s hitting `InvalidJump (ret: [] instead of [..., 1] at erc20.rs:295:9)`. the stack’s fine `(SP = 1 from call_return)`, but the jump target’s off `call_return`’s `_jump()` isn’t landing at `_transfer`’s return point. the jump table’s `original_pc_offset` isn’t syncing right I suppose
 
-I asked Tianyi about this and he said that "...it could be caused by our mock of stack usage in compilation". so he opened [Issue #324](https://github.com/zink-lang/zink/issues/324) and decided that we tackle that first. He also pointed to Huff’s dispatching docs—stack outputs like takes (1) returns (1)—and suggested tests. In response to this, I wrote `tests/stack.rs` for `if-else`, `loops`, and `calls`.
+I asked Tianyi about this and he said "...it could be caused by our mock of stack usage in compilation". so he opened [Issue #324](https://github.com/zink-lang/zink/issues/324) and decided that we tackle that first. He also pointed to Huff’s dispatching docs—stack outputs like takes (1) returns (1)—and suggested tests. In response to this, I wrote `tests/stack.rs` for `if-else`, `loops`, and `calls`.
 
 ## Fixes So Far
 
@@ -135,8 +133,8 @@ Right now, the tests fail with:
 - `if_else_stack: Extra function with SP = 1, expected 0`. Compiler artifact?
 - `loop_stack: Returns 8, not 7.` Test runs the wrong WAT.
 
-The stack’s still haunted. I suspect `call_internal`’s jump handling or `function::new`’s setup is the culprit. 
-Glad I took the advice to write this, it’s clearing my head, but I’m not out of tricks yet.
+Apparently, the stack’s still haunted 😂. I suspect `call_internal`’s jump handling or `function::new`’s setup is the culprit. 
+Anyways, I'm glad I took the advice to write this, it’s clearing my head, but I’m not out of tricks yet.
 
 ## My View: Stack Management is a Puzzle
 The EVM’s stack is unforgiving, and Zink’s job is to map Rust’s abstractions onto it perfectly. Every push and pop has to align, or you’re toast. I’m starting to see stack management as a puzzle, to be honest, each function’s a piece. It’s brutal, but I’m hooked, solving this is an important breakthrough for Zink.
