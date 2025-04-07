@@ -42,7 +42,7 @@
       <p>I’ve been tangled up in a bug in Zink lately that’s been equal parts maddening and fascinating. It’s <a href="https://github.com/zink-lang/zink/issues/306">Issue #306</a>: the ERC20 transfer test in <code>zink/examples/erc20.rs</code> fails with an “Insufficient balance” error, even though the storage shows the right balance. What started as a contract-level puzzle quickly spiraled into a compiler-level labyrinth, which led to <a href="https://github.com/zink-lang/zink/issues/324">Issue #324</a> about stabilizing stack checks. This post is my raw dump—everything I’ve pieced together so far, technical and messy, a map I can always retrace.</p>
 <p>Tianyi encouraged me to write this, pointing out that it’s not just about solving the bug, it’s about building a mental framework for tackling hairy problems like this. He’s right, this might be one of the toughest nuts I’ve cracked in my career, and even if I stumble into a fix with a few lucky lines, the process matters. So here’s the story: the problem, the suspects, the debugging steps, the fixes I’ve tried, and where I’m stuck.</p>
 <h2>The Obvious Problem: ERC20 Transfer Goes Haywire</h2>
-<p>As stated in issue #306, <code>erc20</code> transfer test fails with <code>&quot;Insufficient balance&quot;</code> despite storage showing correct balance value. Yet, during the transfer execution, it behaved as if the sender didn’t have enough tokens (broke, but that wasn’t the case)</p>
+<p>As stated in <a href="https://github.com/zink-lang/zink/issues/306">Issue #306</a>, the <code>ERC20</code> transfer test fails with “Insufficient balance” despite storage showing correct balance value. Yet, during the transfer execution, it behaved as if the sender didn’t have enough tokens (broke, but that wasn’t the case)</p>
 <pre><code class="language-rust">evm = evm.commit(false);
 let info = evm
     .calldata(&amp;contract.encode(&amp;[
@@ -55,7 +55,7 @@ println!(&quot;{info:?}&quot;);
 assert_eq!(info.ret, true.to_bytes32(), &quot;{info:?}&quot;);
 </code></pre>
 <h2>Debugging: Chasing the Stack Ghost</h2>
-<p>In an attempt to trace this issue, I added debug prints at some points in the test and the process of doing this I noticed a bug in <code>_update</code>’s logic:</p>
+<p>In an attempt to trace this issue, I added debug prints at some points in the test and in the process of doing this I noticed a bug in <code>_update</code>’s logic:</p>
 <pre><code class="language-rust">if to.eq(Address::empty()) {
     TotalSupply::set(TotalSupply::get().sub(value));
 } else {
@@ -74,7 +74,7 @@ Balances::set(to, to_balance.add(value));
 }
 DebugEvent::TestLog(U256::from(99)).emit();
 </code></pre>
-<p>The bug wasn’t “insufficient balance” (that was a misread)—it was a stack underflow when <code>_update</code> returned to <code>_transfer</code>. <code>_transfer</code> expects a bool (<code>SP = 1</code>), but <code>_update</code> was leaving <code>SP = 0</code>, tanking at <code>call_retur</code>n’s <code>_jump()</code>. So I traced it to the else branch not setting up a return value, unlike linear flows that implicitly worked (straight up logic without if-else, just if branch worked too).</p>
+<p>The bug wasn’t “Insufficient balance” (that was a misread)—it was a stack underflow when <code>_update</code> returned to <code>_transfer</code>. <code>_transfer</code> expects a bool (<code>SP = 1</code>), but <code>_update</code> was leaving <code>SP = 0</code>, tanking at <code>call_return</code>’s <code>_jump()</code>. So I traced it to the else branch not setting up a return value, unlike linear flows that implicitly worked (straight up logic without if-else, just if branch worked too).</p>
 <p>I fixed it by updating <code>call_return</code> to push 1 for <code>empty-result</code> internal calls:</p>
 <pre><code class="language-rust">pub fn call_return(&amp;mut self, results: &amp;[ValType]) -&gt; Result&lt;()&gt; {
     let len = results.len() as u16;
@@ -104,19 +104,21 @@ DebugEvent::TestLog(U256::from(99)).emit();
     Ok(())
 }
 </code></pre>
-<p>the <code>_push1(1)</code> and <code>_jump()</code> worked for <code>_update</code>, but for <code>name()</code> (a public call with <code>abi.is_some()</code>), it added an extra jump that broke the <code>main_return</code> flow (<code>RETURN</code> for string data). Reverting to the old version fixed <code>name()</code>:</p>
+<p>The <code>_push1(1)</code> and <code>_jump()</code> worked for <code>_update</code>, but for <code>name()</code> (a public call with <code>abi.is_some()</code>), It added an extra jump that broke the <code>main_return</code> flow (<code>RETURN</code> for string data). Reverting to the old version fixed <code>name()</code>:</p>
 <pre><code class="language-rust">_ =&gt; {
     self.table.label(frame.original_pc_offset, self.masm.pc());
     self.masm._jumpdest()?;
     Ok(())
 }
 </code></pre>
-<p>now <code>name()</code> returns <code>&quot;The Zink Language&quot;</code> again, but <code>_transfer</code>’s hitting <code>InvalidJump (ret: [] instead of [..., 1] at erc20.rs:295:9)</code>. the stack’s fine <code>(SP = 1 from call_return)</code>, but the jump target’s off <code>call_return</code>’s <code>_jump()</code> isn’t landing at <code>_transfer</code>’s return point. the jump table’s <code>original_pc_offset</code> isn’t syncing right I suppose</p>
+<p>Now <code>name()</code> returns <code>&quot;The Zink Language&quot;</code> again, but <code>_transfer</code>’s hitting <code>InvalidJump (ret: [] instead of [..., 1] at erc20.rs:295:9)</code>. The stack’s fine <code>(SP = 1 from call_return)</code>, but the jump target’s off <code>call_return</code>’s <code>_jump()</code> isn’t landing at <code>_transfer</code>’s return point. The jump table’s <code>original_pc_offset</code> isn’t syncing right I suppose.</p>
 <p>I asked Tianyi about this and he said “…it could be caused by our mock of stack usage in compilation”. so he opened <a href="https://github.com/zink-lang/zink/issues/324">Issue #324</a> and decided that we tackle that first. He also pointed to Huff’s dispatching docs—stack outputs like takes (1) returns (1)—and suggested tests. In response to this, I wrote <code>tests/stack.rs</code> for <code>if-else</code>, <code>loops</code>, and <code>calls</code>.</p>
 <h2>Fixes So Far</h2>
 <p>Here’s what I’ve tried to stabilize the stack:</p>
-<p>Fix 1: Tweak Internal Calls
-In visitor/call.rs, I cut the initial increment_sp(1) in call_internal and adjusted SP post-call:</p>
+<ul>
+<li>Fix 1: Tweak Internal Calls
+In visitor/call.rs, I cut the initial increment_sp(1) in call_internal and adjusted SP post-call:</li>
+</ul>
 <pre><code class="language-rust">let current_sp = self.masm.sp();
 while current_sp &gt; *results as u16 {
     self.masm._drop()?;
@@ -125,8 +127,10 @@ if current_sp &lt; *results as u16 {
     self.masm.increment_sp(*results as u16 - current_sp)?;
 }
 </code></pre>
-<p>Fix 2: Enforce Stack at _end
-In visitor/control.rs, I made _end check SP against returns:</p>
+<ul>
+<li>Fix 2: Enforce Stack at _end
+In visitor/control.rs, I made _end check SP against returns:</li>
+</ul>
 <pre><code class="language-rust">if self.masm.sp() != self.returns {
     return Err(Error::StackMismatch { expected: self.returns, found: self.masm.sp() });
 }
