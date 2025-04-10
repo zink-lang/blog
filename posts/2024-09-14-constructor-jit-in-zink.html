@@ -1,0 +1,105 @@
+
+<html lang="en" class="dark dark:bg-black">
+  <head>
+    <title>Constructor JIT in Zink?</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <meta name="description" content="Empowering everyone to build reliable and efficient static site.">
+    <link rel="icon" type="image/x-icon" href="/favicon.ico">
+
+    <!-- twitter -->
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:site" content="@zinklang">
+    <meta name="twitter:creator" content="@">
+
+    <!-- og -->
+    <meta property="og:title" content="Constructor JIT in Zink?">    
+    <meta property="og:description" content="Do we really need constructor?">
+    <meta property="og:image" content="https://avatars.githubusercontent.com/u/138247979?s&#x3D;400&amp;u&#x3D;f5c906945b7378f8063d845c7181e7a3f0e25070&amp;v&#x3D;4">
+    
+    <!-- theme  -->
+    <link rel="stylesheet" href="/theme.css">
+
+    <!-- favicon -->
+        <link rel="shortcut icon" href="//favicon.ico">
+
+    <!-- styles for post -->
+        <link rel="stylesheet" href="/highlight.css">
+        <script src="/highlight.js" defer></script>
+
+    <!-- livereload -->
+</head>
+  <body class="dark:text-white p-8">
+     <nav class="mb-10">
+    <a href="/"><span class="text-3xl bold"> Zink Blog </span></a>
+</nav>
+     <article class="prose dark:prose-invert pt-6 max-w-5xl mx-auto">
+    <h1 class="underline">Constructor JIT in Zink?</h1>
+    <div class="text text-zinc-500 font-bold">
+      Sep. 14, 2024 · <a href="https://x.com/" target="_blank">tianyi</a>
+    </div>
+    <div class="mt-6">  
+      <p>The constructor implementation of zink was following solidity at the beginning till I found that I actually 
+missed the tests of it, and the result is, my implementation does not work at all… So I have to back to
+fix the constructor in zink to continue the ERC20 implementation.</p>
+<p>While doing this dirty work, I realized that the constructor implementation in solidity is actually overkilled 
+for zink since it is a bit too verbose for adapting corner cases.</p>
+<h2>Constructor Layout in Solidity</h2>
+<p>According to <a href="https://docs.soliditylang.org/en/latest/internals/layout_in_calldata.html#layout-of-call-data">Layout of Call Data</a>, solidity compiler needs to process <code>codecopy</code>, <code>mload</code>, etc.
+for loading parameters from the end of the bytecode and passing them to the constructor function, for example:</p>
+<pre><code class="language-yul">// @program: set storage in constructor and get it in the deployed contract.
+
+// init code
+//
+// 1. Copy parameters to memory
+// 2. Load parameter to stack
+// 3. store parameter in storage
+PUSH1, 0x01, PUSH1, 0x17, PUSH1, 0x1f, CODECOPY, PUSH0, MLOAD, PUSH0, SSTORE
+
+// return logic - calculate the position of runtime bytecode and return it
+PUSH1, 0x02, PUSH1, 0x15, PUSH0, CODECOPY, PUSH1, 0x02, PUSH0, RETURN
+
+// runtime bytecode - Load the parameter set in constructor from storage
+PUSH0, MLOAD
+
+// parameters - 0x42
+PUSH1, 0x42
+</code></pre>
+<p>The instructions could also be like below if we compile the init code just in time </p>
+<pre><code class="language-yul">// init code - just push the parameter
+PUSH1, 0x42, PUSH0, SSTORE
+
+// return logic - same
+PUSH1, 0x02, PUSH1, 0x0d, PUSH0, CODECOPY, PUSH1, 0x02, PUSH0, RETURN
+
+// runtime bytecode - same
+PUSH0, MLOAD
+
+// parameters - none
+</code></pre>
+<p>But if so, why solidity takes so much for loading constructor parameters instead of compiles them on creation? If 
+I’m not mistaken, they may just want to adapt the case that deploying contracts based on on-chain data, block number, 
+timestamp, etc. or the state of deployed contracts.</p>
+<h2>No Constructor but <code>Constructor</code> in Zink</h2>
+<p>Considering about the constructor is only used for presetting storage most of the time, pro-macro <code>constructor</code> in 
+zink is finally removed in <a href="https://github.com/zink-lang/zink/pull/229">#229</a>, and <code>Constructor</code> is introduced instead for wrapping runtime bytecode on 
+demand, as a code snippet:</p>
+<pre><code class="language-rust">use zinkc::Constructor;
+
+fn to_bytecode(runtime_bytecode: &amp;[u8]) -&gt; Result&lt;Vec&lt;u8&gt;&gt; { 
+  let mut constructor = Constructor::default();
+  let bytecode = constructor
+    .storage(&amp;[(b&quot;storage_key&quot;, b&quot;storage_value&quot;)].collect())?
+    .finished(runtime_bytecode);
+}
+</code></pre>
+<p>There will be no constructor but <code>Constructor</code> in zink… </p>
+<h2>Future Plans</h2>
+<p>I’m now pushing the ERC20 implementation straightforwardly since it has been the next milestone since last year… I 
+have to admit that I failed this dreaming project in the past days of 2024, 3 months, let’s see what we’ll archive in 2024.</p>
+
+    </div>    
+</article>
+     <footer></footer>
+  </body>
+</html>

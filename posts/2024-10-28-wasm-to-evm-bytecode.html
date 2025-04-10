@@ -1,0 +1,188 @@
+
+<html lang="en" class="dark dark:bg-black">
+  <head>
+    <title>Dark magics in Zink</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <meta name="description" content="Empowering everyone to build reliable and efficient static site.">
+    <link rel="icon" type="image/x-icon" href="/favicon.ico">
+
+    <!-- twitter -->
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:site" content="@zinklang">
+    <meta name="twitter:creator" content="@">
+
+    <!-- og -->
+    <meta property="og:title" content="Dark magics in Zink">    
+    <meta property="og:description" content="How zink translate WASM to EVM bytecode">
+    <meta property="og:image" content="https://avatars.githubusercontent.com/u/138247979?s&#x3D;400&amp;u&#x3D;f5c906945b7378f8063d845c7181e7a3f0e25070&amp;v&#x3D;4">
+    
+    <!-- theme  -->
+    <link rel="stylesheet" href="/theme.css">
+
+    <!-- favicon -->
+        <link rel="shortcut icon" href="//favicon.ico">
+
+    <!-- styles for post -->
+        <link rel="stylesheet" href="/highlight.css">
+        <script src="/highlight.js" defer></script>
+
+    <!-- livereload -->
+</head>
+  <body class="dark:text-white p-8">
+     <nav class="mb-10">
+    <a href="/"><span class="text-3xl bold"> Zink Blog </span></a>
+</nav>
+     <article class="prose dark:prose-invert pt-6 max-w-5xl mx-auto">
+    <h1 class="underline">Dark magics in Zink</h1>
+    <div class="text text-zinc-500 font-bold">
+      Oct. 28, 2024 · <a href="https://x.com/" target="_blank">tianyi</a>
+    </div>
+    <div class="mt-6">  
+      <p>For those who may not know, Rust is a systems programming language known for its memory safety features and performance.
+EVM (Ethereum Virtual Machine) is the runtime environment for Ethereum smart contracts, responsible for executing bytecode
+written in languages like Solidity.</p>
+<p>So, what makes it possible to write Rust EVM smart contracts with Zink? Let’s dive into the “dark magics” of Zink!</p>
+<h2>1. What is Zink?</h2>
+<p><a href="https://github.com/zink-lang/zink">Zink</a> is a rustic smart contract language for EVM, it uses WebAssembly (WASM) as an
+intermediate format before generating EVM bytecode.</p>
+<h3>1.1. Why using WASM ?</h3>
+<p>We’re choosing WASM as the intermediate representation with the following reasons:</p>
+<ol>
+<li>WASM can be compiled from rust source code directly</li>
+<li>WASM has simple instruction set, 172 instructions in the MVP implementation (127 of them are numeric instructions).</li>
+<li>WASM is backed by Mozilla and the Rust Team and widely used by the leading companies in the world, it has powerful toolchains.</li>
+<li>WASM is designed for stack machine, it’s perfectly matched with EVM.</li>
+</ol>
+<h3>1.2. Challenges translating WASM to EVM bytecode</h3>
+<p>Even though WASM is designed for stack based machine, it can not be executed by EVM directly for several reasons:</p>
+<ol>
+<li><strong>Instruction Set</strong>: EVM has its own instruction set, which is optimized for executing smart contracts. WASM, on the other
+hand, has a different instruction set that is designed for general-purpose computation.</li>
+<li><strong>Memory Model</strong>: EVM uses a memory model that is specific to Ethereum’s blockchain architecture. WASM, being a stack-based 
+virtual machine, has its own memory model that is not compatible with EVM’s memory layout.</li>
+<li><strong>Function Call Conventions</strong>: EVM has its own function call conventions, which are designed for executing Solidity smart 
+contracts. WASM, being a stack-based VM, uses different function call conventions that would need to be adapted for execution 
+on the EVM.</li>
+</ol>
+<h2>2. Instruction Mappings</h2>
+<p>As mentioned above, WASM and EVM bytecode have different ISA (see <a href="https://pengowray.github.io/wasm-ops/">Webassembly Opcodes</a> and
+<a href="https://www.evm.codes/">EVM Opcode Opcodes Interactive Reference</a>), what we need to do first is actually mapping the 
+shared opcodes from WASM to EVM directly, once all of the WASM opcodes can be mapped to EVM opcodes safely
+and correctly, any of WASM can be translated to EVM bytecode.</p>
+<h3>2.1. Control Flow ( 0x00 - 0x1f )</h3>
+<table><thead><tr><th>WASM Opcode Hex</th><th>WASM</th><th>EVM</th><th>Description</th></tr></thead><tbody>
+<tr><td>0x00</td><td>unreachable</td><td>INVALID</td><td>-</td></tr>
+<tr><td>0x01</td><td>nop</td><td>JUMPDEST</td><td>JUMPDEST in EVM performs nop as well</td></tr>
+<tr><td>0x02 - 0x1f</td><td>control flow</td><td>JUMP &amp; JUMPI</td><td>need structured instructions based on JUMP</td></tr>
+</tbody></table>
+<p>As we can see in the control flow instruction set, some of the opcodes can be mapped to EVM opcodes in per opcode level, like
+<code>unreachable</code> and <code>nop</code>, others are required <strong>structured instructions</strong>, see <a href="https://docs.zink-lang.org/compiler/control-flow.html#select">select</a> as an example.</p>
+<h3>2.2. Memory &amp; Locals ( 0x20 - 0x44 )</h3>
+<p>These opcodes can not be simply mapped since WASM has different memory model with EVM, they will be translated to different
+instructions in different cases, see <code>3.2.</code> for more details.</p>
+<ol>
+<li><strong>local</strong> will be translated to memory or calldata operations like <code>MLOAD</code> or <code>CALLDATALOAD</code>.</li>
+<li><strong>const</strong> will be translated to <code>PUSH(n) + {value}</code></li>
+<li><strong>global</strong> fetches bytes from data section and then do stack pushing like <strong>const</strong></li>
+</ol>
+<p>Some opcodes are banned since they are not adapatable, for example <code>global.get</code>, <code>memory.x</code>, once zink compiler reaches these
+opcodes, panic occurs, however, zink provides different approaches for replacing the logic which can generate these opcodes,
+see <code>3</code> for more details.</p>
+<h3>2.3. Numeric operations ( 0x44 - 0xbf )</h3>
+<p>WASM supports <code>i32</code> and <code>i64</code> as number types, for EVM, it’s <code>u256</code>, and since EVM only has <code>u256</code> as number (bigger than <code>i64</code>),
+all WASM numbers and their operations can be perfectly mapped to EVM in per opcode level or chained instructions.</p>
+<h2>3. Memory Allocator</h2>
+<p>Due to EVM and WASM have different memory models, memory operations in WASM could not be reflected to EVM, and that’s why zink
+bans all memory operations in rust, however, it’s not that serious since reducing memory operations in EVM is also a key point
+of saving gas, see our move in the followings.</p>
+<h3>3.1. Iteration</h3>
+<p>Iteration is banned since the iter in the core library of rust generates memory operations, instead, we need to provide customized
+iterator for arraylike types used in zink ourselves for generating EVM compatible bytecode.</p>
+<pre><code class="language-rust">// This generates iter method from core library, will panic in zink compiler.
+[1, 2, 3].iter();
+
+// instead, zink will provide `Arraylike` type for the iteration feature
+trait ArrayLike&lt;T&gt; {
+  /// Memory pointer generated by the compiler
+  const fn memory_slot() -&gt; u32;
+  
+  // get the next ptr of this iteration
+  fn next_ptr();
+  
+  // reset the ptr of this iteration
+  fn reset_ptr();
+}
+
+impl&lt;T&gt; ArrayLike&lt;T&gt; {
+  /// we can not use `Iter` or `IntoIter` trait from the core library, they will generate unexpected bytecode.
+  pub fn next(&amp;self) {
+    // These block will be assembly EVM bytecode doing the following things
+    //
+    // 1. get the memory pointer of this array
+    // 2. get the next value of the array
+  }
+}
+</code></pre>
+<p>With our asm instructions, the <code>ArrayLike</code> will generate similar code for array operations like solidity does.</p>
+<h3>3.2. Function Arguments</h3>
+<p>WASM has instructions of locals while EVM doesn’t, in zink we do the similar stuffs like <code>3.1.</code> mentions, fill the logic with assembly
+code, but since there are <code>calldata</code>, <code>memory</code> and <code>code</code> concepts in EVM, we’re dispatching locals dynamically.</p>
+<p>Zink filters locals as function arguments and local variables, arguments in function selector will use calldata and all of the others
+will have their own memory slots, for example:</p>
+<pre><code class="language-rust">// (argument) slot0: x 
+// (argument) slot1: y
+// (local variable) slot2: z
+pub fn main(x: u32, y: u32) -&gt; u32 {
+    let z = x + y;
+    return z
+}
+</code></pre>
+<p>This contract will have 3 locals in WASM ( due to the optimizations in zink, there will be no locals in this contract in the real cases,
+instead, <code>x</code> and <code>y</code> will be extracted from calldata and z will be returned directly without assigning a new local ), each of them will
+have their own memory slot.</p>
+<p><code>code</code> will only be used when we need to share large instructions to different functions without using a function.</p>
+<h3>3.3 Foreign Types</h3>
+<p>As we mentioned before, WASM only has <code>i32</code> and <code>i64</code> as number types, some solidity types are hard to be translated for example, <code>address</code>
+and <code>u256</code>, which they are actually <code>[u8; 20]</code> and <code>[u8; 32]</code> in rust.</p>
+<ol>
+<li>Due to <code>address</code> and <code>u256</code> have the same representation in EVM bytecode ( 32 bytes ), we can merge them just into <code>u256</code>.</li>
+<li>In the bytecode level, <code>i32</code> and <code>i64</code> are <code>u256</code> as well.</li>
+</ol>
+<p>This is how EVM works tbh, all types are actually <code>u256</code> in the bytecode level, so the problem we need to solve is that representing <code>u256</code>
+from <code>rust</code> and <code>WASM</code> without introducing redundant bytecode.</p>
+<p>Since our goal is compiling rust to EVM bytecode, we have to handle most generated WASM bytecode, but not all, for <code>u256</code> type, we can use
+translate it with assembly code directly! </p>
+<pre><code>#[cfg(feature = &quot;evm&quot;)]
+pub struct U256(
+// The i32 here is a placeholder to identify this type in WASM
+i32
+);
+
+#[cfg(feature = &quot;evm&quot;)]
+impl U256 {
+  // addition of two u256
+  pub fn add(&amp;self, rhs: U256) -&gt; U256 {
+    zink::asm::add(self, rhs)
+  }
+}
+</code></pre>
+<p>And this is the wrap, you may curious how to make a real <code>i32</code> safe from WASM to EVM, the answer is that we need to append chained instructions
+after operations of <code>i32</code> to confirm there’s no overflows, using <code>U256</code> as the default number type will be recommend in zink as well!</p>
+<h2>4. Function Calls</h2>
+<p>Instruction like <code>address</code> from EVM does not exist in WASM, however, WASM’s host functions are perfectly matched with these:</p>
+<pre><code>#[link(wasm_import_module = &quot;evm&quot;)]
+#[allow(improper_ctypes)]
+extern &quot;C&quot; {
+  pub fn address() -&gt; Address;
+}
+
+let addr = address();
+</code></pre>
+<p>When zink compiler reaches the host function <code>evm::address</code>, it simply emits the EVM opcode of <code>address</code> to the contract bytecode.</p>
+
+    </div>    
+</article>
+     <footer></footer>
+  </body>
+</html>

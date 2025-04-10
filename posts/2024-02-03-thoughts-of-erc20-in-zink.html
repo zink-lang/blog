@@ -1,0 +1,158 @@
+
+<html lang="en" class="dark dark:bg-black">
+  <head>
+    <title>Thoughts of ERC-20 in Zink</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <meta name="description" content="Empowering everyone to build reliable and efficient static site.">
+    <link rel="icon" type="image/x-icon" href="/favicon.ico">
+
+    <!-- twitter -->
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:site" content="@zinklang">
+    <meta name="twitter:creator" content="@">
+
+    <!-- og -->
+    <meta property="og:title" content="Thoughts of ERC-20 in Zink">    
+    <meta property="og:description" content="Thoughts about the storage implementation in zink.">
+    <meta property="og:image" content="https://avatars.githubusercontent.com/u/138247979?s&#x3D;400&amp;u&#x3D;f5c906945b7378f8063d845c7181e7a3f0e25070&amp;v&#x3D;4">
+    
+    <!-- theme  -->
+    <link rel="stylesheet" href="/theme.css">
+
+    <!-- favicon -->
+        <link rel="shortcut icon" href="//favicon.ico">
+
+    <!-- styles for post -->
+        <link rel="stylesheet" href="/highlight.css">
+        <script src="/highlight.js" defer></script>
+
+    <!-- livereload -->
+</head>
+  <body class="dark:text-white p-8">
+     <nav class="mb-10">
+    <a href="/"><span class="text-3xl bold"> Zink Blog </span></a>
+</nav>
+     <article class="prose dark:prose-invert pt-6 max-w-5xl mx-auto">
+    <h1 class="underline">Thoughts of ERC-20 in Zink</h1>
+    <div class="text text-zinc-500 font-bold">
+      Feb. 03, 2024 · <a href="https://x.com/" target="_blank">cydonia</a>
+    </div>
+    <div class="mt-6">  
+      <p>Have been stuck in the development of zink for around 2 months, feeling my life is worthless though these days since 
+I haven’t done anything that I’m feeling proud of.</p>
+<p>The ERC20 implementation in zink is a big picture which leads zink to a real programming language of EVM when it gets
+completed, I’m too scared to see that something <strong>solidity</strong> can do but <strong>zink</strong> can not that I could not even push one 
+more commit in zink these days.</p>
+<h2>Splitting Problems</h2>
+<p>Another night without sleeping, tired of video games again finally, get up and check the code base of zink, I found that
+I have already cleaned the code structure of the code generation module last time which makes it easier to catch up my 
+previous work this time.</p>
+<p>What if I just start my work on ERC20, splitting the problems out into issues like always, the layout of <a href="https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/token/ERC20/ERC20.sol">ERC20</a> is 
+pretty simple, ERCs in zink will be implemented in rust traits without doubts. </p>
+<pre><code class="language-solidity">abstract contract ERC20 is Context, IERC20, IERC20Metadata, IERC20Errors {
+    mapping(address account =&gt; uint256) private _balances;
+    
+    // ...
+    
+    /**
+     * @dev Sets the values for {name} and {symbol}.
+     *
+     * All two of these values are immutable: they can only be set once during
+     * construction.
+     */
+    constructor(string memory name_, string memory symbol_) {
+        _name = name_;
+        _symbol = symbol_;
+    }
+}
+</code></pre>
+<h2>Storage</h2>
+<p>Mapping storage is missing in zink for now bcz I haven’t got a perfect idea for passing bytes from rust to evm yet.</p>
+<pre><code class="language-solidity">mapping(address account =&gt; uint256) private _balances;
+</code></pre>
+<p>But for doing it in hard way, I have already got an idea from the design of my old friend <a href="https://github.com/paritytech/ink">ink</a>, for the <a href="https://docs.rs/ink/latest/ink/storage/struct.Mapping.html">Mapping</a>
+storage implementation in <strong>ink</strong>, they are mapping pairs into storage slots, mb it doesn’t look clever but it seems that this is 
+the best solution anyway.</p>
+<pre><code class="language-rust">pub struct Mapping&lt;K, V: Packed, KeyType: StorageKey = AutoKey&gt; {
+    #[allow(clippy::type_complexity)]
+    _marker: PhantomData&lt;fn() -&gt; (K, V, KeyType)&gt;,
+}
+</code></pre>
+<p>I was actually struggling with how to use rust’s <strong>BTreeMap</strong> in zink before, using <strong>BTreeMap</strong> is friendly to
+rust developers because we are familiar with it, however there are two big problems in it:</p>
+<ul>
+<li>The methods of <strong>BTreeMap</strong> or any <strong>Iterator</strong> requires allocation from memory which will embed tons of code
+to support it.</li>
+<li>Even if we are okay with the tons of allocation code, store a encoded <strong>BtreeMap</strong> in evm takes a lot anyway,
+bcz we need to handle encoding/decoding stuffs which burns gas a lot.</li>
+</ul>
+<p>In conclusion, due to the two points above, it is very unfortunate that using Rust’s <strong>BtreeMap</strong> in zink is not 
+a proper solution.</p>
+<h3>Store <code>bytes</code> in zink!</h3>
+<p>Zink currently only support <code>i32</code> in storage, bcz I haven’t got a solution passing bytes elegantly yet, but for moving forward
+to the goal of ERC20, I compromise to implement it anyway, the current solution requires an <code>Abi</code> trait <em>(I hate the naming <code>Abi</code>, 
+because it can describe too many interfaces in zink xd)</em>.</p>
+<pre><code class="language-rust">pub trait Abi {
+    fn write(&amp;self) -&gt; Result&lt;()&gt;;
+}
+
+// ... impl Abi for number types
+impl Abi for i32 {}
+
+// ... impl Abi for bytes 
+impl Abi for [u8; 0] {}
+impl Abi for [u8; 1] {}
+// ...
+impl Abi for [u8; 32] {}
+</code></pre>
+<p><code>sstore</code> requires two stack inputs as key and value, for simplifying the problem, for the types which implements <code>Abi</code>, we only need to 
+make sure that they can be transformed into bytes under the length 32 at the moment.</p>
+<pre><code class="language-yul">PUSH0 // key
+PUSH0 // value
+SSTORE
+</code></pre>
+<p>Thus we need generate matched FFI for these stuffs as well, which is closed to the assembly implementation,</p>
+<pre><code class="language-rust">mod ffi { 
+  fn store_key_i32_value_i32(key: i32, value: i32) {}
+  fn store_key_i32_value_bytes(key: i32, ptr: i32, length: i32) {}
+  // ... everything
+}
+</code></pre>
+<p>I love writing macros in rust but not the generated code like above looks really ugly, but seems I have to do it now anyway.</p>
+<h3>Store maps in zink</h3>
+<p>I don’t like the naming <code>mapping</code> because it is too long, so if I can choose, I’ll use <code>map</code> because it is shorter, typescript is using <code>Map</code> 
+or <code>Record</code> as well, so I don’t understand why solidity is using the keyword <code>mapping</code>, mb because they have token <code>=&gt;</code> in the storage declaration,
+and they want to express <strong>ing</strong>.</p>
+<p>So for <code>Map</code> in zink, it will follow the well-designed <code>Mapping</code> in <code>ink</code>, provided <code>Key</code>, <code>Value</code>, and <code>Prefix</code>, the problem will be concatenating
+the storage key in zink.</p>
+<p>And the solution is using macro, again:</p>
+<pre><code class="language-rust">mod ffi {
+  fn store_map_key_i32_value_i32(prefix: i32, key: i32, value: i32) {}
+  fn store_map_key_i32_value_bytes(prefix: i32, key: i32, ptr: i32, length: i32) {}
+}
+</code></pre>
+<p>However, we can fix <code>i32</code> as prefix this time, because the storage keys of a contract may never reach the max limit of <code>i32</code>. </p>
+<h2>Interfaces</h2>
+<p>After solving the storage problem, the next one is the design of <code>interface</code> in zink, like mentioned above, we can use trait without doubts, but the 
+problem is that we need to export the methods provided by traits to WASM as well, hmm, this problem leads us to a derive macro,</p>
+<pre><code class="language-rust">
+#[derive(Erc20)]
+struct MyContract {}
+
+// Which generates
+
+#[no_mangle]
+extern &quot;C&quot; fn total_supply() {}
+</code></pre>
+<p>Looks weird, but it works, should zink ask users to use <code>MyContract</code> to define the namespace is a problem as well, maybe we can provide different 
+solutions for this first, but as the experience from apple, we’d better only give users the best solution finally at this kind of points.</p>
+<h2>Errors and Events</h2>
+<p>Errors and events are about to be refactored as well since now we have a solution for passing bytes in zink now, even it is ugly, but it is best
+solution for now ))</p>
+
+    </div>    
+</article>
+     <footer></footer>
+  </body>
+</html>
